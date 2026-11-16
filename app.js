@@ -27,7 +27,115 @@
   var state = null;
   var toastTimer = null;
   var pollTimer = null;
+  var noteTimer = null;
   var pushChain = Promise.resolve();
+  var drafts = {}; /* felt-udkast, så synk ikke overskriver det, man er i gang med at skrive */
+
+  function focusedField() {
+    var el = document.activeElement;
+    if (!el || el === document.body || el === document.documentElement) return null;
+    var tag = (el.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable) return el;
+    return null;
+  }
+  function isEditing() {
+    if (focusedField()) return true;
+    if (drafts.note && drafts.note.dirty) return true;
+    return false;
+  }
+  function captureFocus() {
+    var el = focusedField();
+    if (!el) return null;
+    return {
+      act: el.getAttribute("data-act") || "",
+      id: el.getAttribute("data-id") || "",
+      i: el.getAttribute("data-i") || "",
+      value: el.value,
+      start: el.selectionStart,
+      end: el.selectionEnd,
+      scrollTop: el.scrollTop
+    };
+  }
+  function findCapturedField(root, snap) {
+    if (!snap) return null;
+    var nodes = (root || document).querySelectorAll("input, textarea, select");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if ((el.getAttribute("data-act") || "") !== snap.act) continue;
+      if ((el.getAttribute("data-id") || "") !== snap.id) continue;
+      if ((el.getAttribute("data-i") || "") !== snap.i) continue;
+      return el;
+    }
+    return null;
+  }
+  function restoreFocus(root, snap) {
+    if (!snap) return;
+    var el = findCapturedField(root, snap);
+    if (!el) return;
+    if (snap.value != null && el.value !== snap.value) el.value = snap.value;
+    try { el.focus(); } catch (e) {}
+    try {
+      if (typeof el.setSelectionRange === "function" && snap.start != null) {
+        el.setSelectionRange(snap.start, snap.end);
+      }
+      if (snap.scrollTop != null) el.scrollTop = snap.scrollTop;
+    } catch (e2) {}
+  }
+  function persistQuiet() {
+    if (state) state.updatedAt = Date.now();
+    saveLocal();
+    schedulePush();
+  }
+  function renderSafe() {
+    if (isEditing()) patchChrome();
+    else render();
+  }
+  function patchChrome() {
+    var root = document.getElementById("app");
+    if (!root) return;
+    var pill = root.querySelector(".sync-pill");
+    if (pill) {
+      var wrap = document.createElement("div");
+      wrap.innerHTML = syncPill();
+      if (wrap.firstChild) pill.replaceWith(wrap.firstChild);
+    }
+    var oldToast = root.querySelector(".toast");
+    var html = renderToast();
+    if (html) {
+      var wrap2 = document.createElement("div");
+      wrap2.innerHTML = html;
+      if (oldToast) oldToast.replaceWith(wrap2.firstChild);
+      else root.appendChild(wrap2.firstChild);
+    } else if (oldToast) {
+      oldToast.remove();
+    }
+  }
+  function reapplyDrafts() {
+    if (drafts.note && drafts.note.dirty && state) {
+      var m = me();
+      if (m && drafts.note.day) {
+        var cur = ensureDay(m, drafts.note.day);
+        cur.note = drafts.note.value;
+      }
+    }
+  }
+  function scheduleNoteSave(text) {
+    drafts.note = { value: text, dirty: true, day: session.day };
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(flushNote, 800);
+  }
+  function flushNote() {
+    clearTimeout(noteTimer);
+    noteTimer = null;
+    if (!drafts.note || !drafts.note.dirty) return;
+    var text = drafts.note.value;
+    var day = drafts.note.day;
+    drafts.note.dirty = false;
+    setNote(text, { quiet: true, day: day });
+  }
+  function flushAllDrafts() {
+    flushNote();
+  }
 
   function $(sel, root) { return (root || document).querySelector(sel); }
   function esc(s) {
@@ -96,15 +204,16 @@
 
   function toast(msg) {
     session.toast = msg;
-    render();
+    renderSafe();
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { session.toast = null; render(); }, 2400);
+    toastTimer = setTimeout(function () { session.toast = null; renderSafe(); }, 2400);
   }
 
-  function openSheet(name, data) { session.sheet = { name: name, data: data || {} }; render(); }
-  function closeSheet() { session.sheet = null; render(); }
+  function openSheet(name, data) { flushAllDrafts(); session.sheet = { name: name, data: data || {} }; render(); }
+  function closeSheet() { flushAllDrafts(); session.sheet = null; render(); }
 
   function go(page) {
+    flushAllDrafts();
     if (page === "dart") page = "forslag";
     session.page = page;
     session.sheet = null;
@@ -135,15 +244,16 @@
       return r.json().then(function (remote) {
         if (remote && typeof remote === "object") {
           state = B.mergeState(state, remote);
+          reapplyDrafts();
           saveLocal();
         }
         session.sync = "ok";
         session.lastSync = Date.now();
-        render();
+        renderSafe();
       });
     }).catch(function () {
       session.sync = "offline";
-      render();
+      renderSafe();
     });
   }
 
@@ -157,10 +267,10 @@
       if (!r.ok) throw new Error("HTTP " + r.status);
       session.sync = "ok";
       session.lastSync = Date.now();
-      render();
+      renderSafe();
     }).catch(function () {
       session.sync = "offline";
-      render();
+      renderSafe();
     });
   }
 
@@ -217,7 +327,16 @@
     var e = B.ENERGY[Math.max(0, Math.min(3, n))];
     if (e) setEnergy(e.id);
   }
-  function setNote(text) { patchMyDay({ note: text }); }
+  function setNote(text, opts) {
+    opts = opts || {};
+    var m = me();
+    if (!m) return;
+    var iso = opts.day || session.day;
+    var cur = ensureDay(m, iso);
+    m.days[iso] = Object.assign({}, cur, { note: text, ts: Date.now() });
+    if (opts.quiet) persistQuiet();
+    else persist();
+  }
 
   function applySuggestion(item, random) {
     state.suggestion = {
@@ -583,8 +702,11 @@
     });
     html += "</div></section>";
 
+    var noteVal = (drafts.note && drafts.note.dirty && drafts.note.day === session.day)
+      ? drafts.note.value
+      : (entry.note || "");
     html += '<section class="card"><h2>Note</h2>' +
-      '<textarea class="note-box" data-act="note" placeholder="Skriv noget">' + esc(entry.note || "") + "</textarea></section>";
+      '<textarea class="note-box" data-act="note" placeholder="Skriv noget">' + esc(noteVal) + "</textarea></section>";
 
     return html;
   }
@@ -878,9 +1000,11 @@
   function render() {
     var root = document.getElementById("app");
     if (!root) return;
+    var snap = captureFocus();
     if (!session.code || !state) {
       root.innerHTML = '<div class="screen" id="screen">' + renderSetup() + "</div>" + renderToast();
       bindFields(root);
+      restoreFocus(root, snap);
       return;
     }
     var body = "";
@@ -892,12 +1016,14 @@
     var tabs = (session.page === "forslag" || session.page === "indstillinger") ? tabBar() : tabBar();
     root.innerHTML = '<div class="screen" id="screen">' + body + "</div>" + tabs + renderSheet() + renderToast();
     bindFields(root);
+    restoreFocus(root, snap);
   }
 
   function bindFields(root) {
     root.querySelectorAll("[data-act=note]").forEach(function (el) {
-      el.addEventListener("change", function () { setNote(el.value); });
-      el.addEventListener("blur", function () { setNote(el.value); });
+      el.addEventListener("input", function () { scheduleNoteSave(el.value); });
+      el.addEventListener("change", function () { scheduleNoteSave(el.value); });
+      el.addEventListener("blur", function () { flushNote(); });
     });
     root.querySelectorAll("[data-act=energy-range]").forEach(function (el) {
       el.addEventListener("change", function () { setEnergyLevel(parseInt(el.value, 10)); });
@@ -1055,6 +1181,7 @@
   }
 
   function handleBack() {
+    if (focusedField()) { flushAllDrafts(); }
     if (session.sheet) { closeSheet(); return true; }
     if (session.page === "forslag" || session.page === "indstillinger") { go("home"); return true; }
     if (session.page && session.page !== "home" && session.code) { go("home"); return true; }
@@ -1062,7 +1189,14 @@
     return false;
   }
 
-  window.BoligApp = { back: handleBack, getState: function () { return state; }, getSession: function () { return session; } };
+  window.BoligApp = {
+    back: handleBack,
+    getState: function () { return state; },
+    getSession: function () { return session; },
+    isEditing: isEditing,
+    pullNow: function () { return pull(); },
+    flushDrafts: flushAllDrafts
+  };
 
   function boot() {
     var root = document.getElementById("app");
