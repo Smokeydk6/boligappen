@@ -656,7 +656,7 @@
       '<header class="hero">' +
       '<img class="mascot" src="mascot.svg" alt="Boligappen">' +
       "<h1>" + esc(greeting()) + (m ? ", " + esc(m.name) : "") + "</h1>" +
-      '<p class="sub">Hvordan har I det i husstanden i dag?</p></header>';
+      '<p class="sub">Hvordan jeg har det i dag?</p></header>';
 
     html += '<section class="card forslag-wrap"><h2>Dagens forslag</h2>';
     if (sug) {
