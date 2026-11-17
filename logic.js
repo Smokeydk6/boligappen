@@ -299,7 +299,8 @@
       hidden: !!a.hidden,
       deleted: !!a.deleted,
       ts: a.ts || 0,
-      deletedTs: a.deletedTs || 0
+      deletedTs: a.deletedTs || 0,
+      authorId: a.authorId || undefined
     };
   }
 
@@ -593,7 +594,51 @@
   }
 
   function enabledMoods(state) {
-    return (state.moods || defaultMoods()).filter(function (m) { return m.on !== false; });
+    return (state.moods || defaultMoods()).filter(function (m) { return m.on !== false && !m.deleted; });
+  }
+
+  /* Humør, der vises i redigeringslisten (slettede egne humør skjules). */
+  function visibleMoods(state) {
+    return (state.moods || defaultMoods()).filter(function (m) { return !m.deleted; });
+  }
+
+  var MOOD_EMOJIS = ["😀","😊","🥰","😎","🤩","🥳","😌","😴","🥱","🤒","😤","😭","🤯","😇","🤔","🫠","🙃","😬",
+    "🍕","☕","🎮","🎉","💤","🔥","🌧️","☀️","💪","🧘","❤️","✨"];
+
+  /* Rens et emoji-felt: trim, maks. et par tegn, ingen HTML. Tom => standard. */
+  function cleanEmoji(s) {
+    var t = String(s == null ? "" : s).replace(/[<>&"'`\s]/g, "").trim();
+    if (!t) return "🙂";
+    var chars = Array.from(t);
+    return chars.slice(0, 8).join("");
+  }
+
+  function cleanMoodLabel(s) {
+    return String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, 24);
+  }
+
+  function makeCustomMood(label, emoji, authorId, now) {
+    var name = cleanMoodLabel(label);
+    if (!name) return null;
+    now = now || Date.now();
+    return {
+      id: "cmood-" + now.toString(36) + Math.random().toString(36).slice(2, 6),
+      label: name,
+      emoji: cleanEmoji(emoji),
+      on: true,
+      custom: true,
+      authorId: authorId || null,
+      deleted: false,
+      ts: now
+    };
+  }
+
+  /* Visning af et humør-id – også ukendte (fx fra en nyere telefon). */
+  function moodDisplay(state, id) {
+    if (!id) return null;
+    var m = findMood(state, id);
+    if (m) return { emoji: m.emoji || "🙂", label: m.label || id };
+    return { emoji: "🙂", label: id };
   }
 
   function findMood(state, id) {
@@ -653,6 +698,13 @@
     mergeMembers: mergeMembers,
     voteCounts: voteCounts,
     enabledMoods: enabledMoods,
+    visibleMoods: visibleMoods,
+    MOOD_EMOJIS: MOOD_EMOJIS,
+    cleanEmoji: cleanEmoji,
+    cleanMoodLabel: cleanMoodLabel,
+    makeCustomMood: makeCustomMood,
+    moodDisplay: moodDisplay,
+    mergeMoods: mergeMoods,
     findMood: findMood,
     monthMatrix: monthMatrix
   };

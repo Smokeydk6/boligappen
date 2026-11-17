@@ -448,3 +448,20 @@ input[type="range"] {
   font-size: 14px;
 }
 .pick-me.on { border-color: var(--pink-deep); background: var(--pink-soft); }
+
+/* v1.4: egne humør + notifikationer */
+.mood-cell.add { border: 2px dashed var(--pink-deep); background: transparent; }
+.mood-cell.add .emo { color: var(--pink-deep); font-weight: 800; }
+.emoji-input-row { display: flex; align-items: center; gap: 10px; margin: 6px 0 4px; }
+.emoji-input-row .emoji-preview { font-size: 30px; width: 44px; text-align: center; }
+.emoji-input-row .emoji-field { flex: 1; font-size: 22px; margin: 0; }
+.mood-edit.sub { padding-left: 18px; }
+.mood-edit .name .you-badge { margin-left: 6px; }
+.notify-card .mood-edit div.name { font-weight: 700; }
+
+/* v1.5: rolig synk – pillen er en knap, der opdaterer */
+button.sync-pill { font: inherit; font-size: 12px; cursor: pointer; }
+.sync-pill .re { font-size: 12px; opacity: 0.6; }
+.sync-pill.pending { background: var(--pink-deep); color: #fff; border-color: transparent; }
+.sync-pill.pending .dot { background: #fff; }
+.sync-pill.pending .re { opacity: 1; }

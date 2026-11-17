@@ -4,6 +4,14 @@
   var B = window.Bolig;
   var SESSION_KEY = "boligappen-session-v1";
   var STATE_KEY = "boligappen-state-v1";
+  var NOTIFY_KEY = "boligappen-notify-v1";
+  var NOTIFY_OPTS = [
+    { id: "mood", label: "Humør og energi", emoji: "😊" },
+    { id: "note", label: "Noter", emoji: "📝" },
+    { id: "forslag", label: "Nye dagens forslag", emoji: "🎲" },
+    { id: "ideer", label: "Idéer til appen", emoji: "💡" },
+    { id: "stemmer", label: "Stemmer", emoji: "🗳️" }
+  ];
   var DOW = ["man", "tir", "ons", "tor", "fre", "lør", "søn"];
   var MONTHS = ["januar", "februar", "marts", "april", "maj", "juni", "juli", "august", "september", "oktober", "november", "december"];
   var MONTHS_SHORT = ["jan.", "feb.", "mar.", "apr.", "maj", "jun.", "jul.", "aug.", "sep.", "okt.", "nov.", "dec."];
@@ -30,6 +38,16 @@
   var noteTimer = null;
   var pushChain = Promise.resolve();
   var drafts = {}; /* felt-udkast, så synk ikke overskriver det, man er i gang med at skrive */
+  /* v1.5 synk: ingen 5-sekunders genopfrisk. Data hentes ved start, når appen kommer frem igen,
+     efter man gemmer, ved tryk på synk-pillen og stille i baggrunden hvert minut.
+     Nye data tegnes aldrig, mens et ark/vindue er åbent, man skriver eller lige har rørt skærmen. */
+  var POLL_MS = 60000;
+  var IDLE_MS = 2500;
+  var pendingRender = false;
+  var lastInteract = 0;
+  var pointerDown = false;
+  var noReloadUntil = 0;
+  var lastPullAt = 0;
 
   function focusedField() {
     var el = document.activeElement;
@@ -42,6 +60,29 @@
     if (focusedField()) return true;
     if (drafts.note && drafts.note.dirty) return true;
     return false;
+  }
+  /* Appen (APK) spørger her, før den genindlæser siden (ved genoptag/træk-ned). */
+  function blocksReload() {
+    if (isEditing()) return true;
+    if (session.sheet) return true;
+    if (Date.now() < noReloadUntil) return true;
+    return false;
+  }
+  /* Må synk tegne skærmen om lige nu? */
+  function isBusy() {
+    if (blocksReload()) return true;
+    if (pointerDown) return true;
+    if (Date.now() - lastInteract < IDLE_MS) return true;
+    return false;
+  }
+  function markInteract() { lastInteract = Date.now(); }
+  /* Tegn nye data fra synk – eller gem dem til senere, hvis brugeren er i gang. */
+  function applyRemoteRender() {
+    if (isBusy()) { pendingRender = true; patchChrome(); }
+    else render();
+  }
+  function flushPendingRender() {
+    if (pendingRender && !isBusy()) render();
   }
   function captureFocus() {
     var el = focusedField();
@@ -86,9 +127,9 @@
     saveLocal();
     schedulePush();
   }
+  /* Kun synk-pille og toast – rører aldrig ark, felter eller scroll. */
   function renderSafe() {
-    if (isEditing()) patchChrome();
-    else render();
+    patchChrome();
   }
   function patchChrome() {
     var root = document.getElementById("app");
@@ -226,30 +267,125 @@
     window.scrollTo(0, 0);
   }
 
+  /* ---------- notifikationer (kun i Android-appen v1.4+) ---------- */
+  var notify = loadNotify();
+  var lastSnapshotAt = 0;
+
+  function loadNotify() {
+    var d = { enabled: false, opts: { mood: true, note: true, forslag: true, ideer: true, stemmer: true } };
+    try {
+      var s = JSON.parse(localStorage.getItem(NOTIFY_KEY) || "null");
+      if (s && typeof s === "object") {
+        d.enabled = !!s.enabled;
+        Object.keys(d.opts).forEach(function (k) { if (s.opts && s.opts[k] === false) d.opts[k] = false; });
+      }
+    } catch (e) {}
+    return d;
+  }
+  function saveNotify() {
+    try { localStorage.setItem(NOTIFY_KEY, JSON.stringify(notify)); } catch (e) {}
+  }
+  function bridge() {
+    var b = window.BoligAndroid;
+    return b && typeof b.setNotifications === "function" ? b : null;
+  }
+  function sendSnapshot(force) {
+    var b = bridge();
+    if (!b || !notify.enabled || !state || typeof b.updateSnapshot !== "function") return;
+    if (!force && Date.now() - lastSnapshotAt < 20000) return;
+    lastSnapshotAt = Date.now();
+    try { b.updateSnapshot(JSON.stringify(state)); } catch (e) {}
+  }
+  /* Sender aktuel opsætning til appen. Returnerer appens svar eller null uden bro. */
+  function syncNotifyConfig() {
+    var b = bridge();
+    if (!b || !session.code || !session.storageUrl) return null;
+    var m = me();
+    try {
+      var res = b.setNotifications(!!notify.enabled, session.storageUrl, session.me || "", (m && m.name) || "",
+        JSON.stringify(notify.opts));
+      if (notify.enabled) sendSnapshot(true);
+      return res;
+    } catch (e) { return null; }
+  }
+  function toggleNotify() {
+    if (!bridge()) {
+      toast("Notifikationer virker kun i Android-appen (v1.4+).");
+      return;
+    }
+    notify.enabled = !notify.enabled;
+    noReloadUntil = Date.now() + 15000; /* Android-tilladelsesdialog må ikke få appen til at genindlæse */
+    saveNotify();
+    var res = syncNotifyConfig();
+    if (notify.enabled && res === "bad-url") {
+      notify.enabled = false;
+      saveNotify();
+      toast("Kunne ikke slå notifikationer til lige nu.");
+    } else if (notify.enabled && res === "on") {
+      toast("Notifikationer er slået til 🔔");
+    } else if (!notify.enabled) {
+      toast("Notifikationer er slået fra.");
+    }
+    render();
+  }
+  function toggleNotifyOpt(id) {
+    if (!(id in notify.opts)) return;
+    notify.opts[id] = !notify.opts[id];
+    saveNotify();
+    syncNotifyConfig();
+    render();
+  }
+  function onNotifyPermission(ok) {
+    if (ok) {
+      toast("Notifikationer er slået til 🔔");
+    } else {
+      notify.enabled = false;
+      saveNotify();
+      syncNotifyConfig();
+      toast("Notifikationer er blokeret. Tillad dem under Android-indstillinger › Apps › Boligappen.");
+    }
+    render();
+  }
+
   /* ---------- synk ---------- */
   function schedulePush() {
     pushChain = pushChain.then(push).catch(function () {});
   }
 
-  function pull() {
+  function stateSig(st) {
+    try { return JSON.stringify(st); } catch (e) { return String(Math.random()); }
+  }
+  /* Flet fjern-data ind. Returnerer true, hvis noget faktisk ændrede sig. */
+  function mergeRemote(remote) {
+    if (!remote || typeof remote !== "object") return false;
+    var before = stateSig(state);
+    state = B.mergeState(state, remote);
+    reapplyDrafts();
+    var changed = stateSig(state) !== before;
+    if (changed) saveLocal();
+    return changed;
+  }
+
+  function pull(opts) {
+    opts = opts || {};
     if (!session.storageUrl) return Promise.resolve();
-    session.sync = session.sync === "offline" ? "offline" : "syncing";
+    lastPullAt = Date.now();
     return fetch(session.storageUrl, { cache: "no-store" }).then(function (r) {
       if (r.status === 404) {
         session.sync = "ok";
         session.lastSync = Date.now();
+        renderSafe();
         return schedulePush();
       }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json().then(function (remote) {
-        if (remote && typeof remote === "object") {
-          state = B.mergeState(state, remote);
-          reapplyDrafts();
-          saveLocal();
-        }
+        var changed = mergeRemote(remote);
         session.sync = "ok";
         session.lastSync = Date.now();
-        renderSafe();
+        sendSnapshot(false);
+        if (opts.force) { if (isEditing() || session.sheet) { pendingRender = pendingRender || changed; patchChrome(); } else render(); }
+        else if (changed) applyRemoteRender();
+        else renderSafe();
       });
     }).catch(function () {
       session.sync = "offline";
@@ -257,14 +393,25 @@
     });
   }
 
+  /* Hent først det nyeste, flet, og gem så – så man aldrig overskriver de andres ændringer. */
   function push() {
     if (!session.storageUrl || !state) return Promise.resolve();
-    return fetch(session.storageUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state)
+    var url = session.storageUrl;
+    return fetch(url, { cache: "no-store" }).then(function (r) {
+      if (r.ok) return r.json().catch(function () { return null; });
+      if (r.status === 404) return null;
+      throw new Error("HTTP " + r.status);
+    }).then(function (remote) {
+      var changed = mergeRemote(remote);
+      if (changed) applyRemoteRender();
+      return fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state)
+      });
     }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
+      sendSnapshot(true);
       session.sync = "ok";
       session.lastSync = Date.now();
       renderSafe();
@@ -279,7 +426,7 @@
     pollTimer = setInterval(function () {
       if (document.hidden) return;
       pull();
-    }, 5000);
+    }, POLL_MS);
   }
 
   function enterHousehold(code, meId, existing) {
@@ -425,7 +572,7 @@
     if (!title) return toast("Skriv et navn til aktiviteten.");
     var tags = d.energyTags && d.energyTags.length ? d.energyTags.slice() : ["mellem"];
     var id = d.isNew ? uid("cact") : (d.id || uid("cact"));
-    upsertCatalogItem({
+    var patch = {
       id: id,
       title: title,
       emoji: (d.emoji || "⭐").trim() || "⭐",
@@ -435,7 +582,9 @@
       custom: d.isNew ? true : !!d.custom,
       hidden: !!d.hidden,
       deleted: false
-    });
+    };
+    if (d.isNew) patch.authorId = session.me;
+    upsertCatalogItem(patch);
     closeSheet();
     toast(d.isNew ? "Aktiviteten er tilføjet." : "Aktiviteten er gemt.");
     if (session.page !== "aktiviteter") go("aktiviteter");
@@ -524,6 +673,49 @@
     });
     persist();
   }
+  function openMoodEditor(id, opts) {
+    opts = opts || {};
+    if (!id) {
+      openSheet("rename-mood", { isNew: true, label: "", emoji: "", select: !!opts.select });
+      return;
+    }
+    var m = B.findMood(state, id);
+    if (!m) return;
+    openSheet("rename-mood", { id: id, label: m.label, emoji: m.emoji, custom: !!m.custom });
+  }
+  function saveMoodFromSheet() {
+    var d = session.sheet && session.sheet.data;
+    if (!d) return;
+    var label = B.cleanMoodLabel(d.label);
+    if (!label) return toast("Skriv et navn til humøret.");
+    if (d.isNew) {
+      var mood = B.makeCustomMood(label, d.emoji, session.me);
+      state.moods = (state.moods && state.moods.length ? state.moods : B.defaultMoods());
+      state.moods.push(mood);
+      closeSheet();
+      if (d.select) { patchMyDay({ mood: mood.id }); }
+      else persist();
+      toast("Humøret er tilføjet – alle i husstanden kan nu vælge det.");
+      return;
+    }
+    (state.moods || []).forEach(function (m) {
+      if (m.id === d.id) {
+        m.label = label;
+        if (d.emoji != null && String(d.emoji).trim()) m.emoji = B.cleanEmoji(d.emoji);
+        m.ts = Date.now();
+      }
+    });
+    closeSheet();
+    persist();
+  }
+  function deleteMood(id) {
+    (state.moods || []).forEach(function (m) {
+      if (m.id === id && m.custom) { m.deleted = true; m.on = false; m.ts = Date.now(); }
+    });
+    closeSheet();
+    persist();
+    toast("Humøret er slettet.");
+  }
   function toggleMood(id) {
     (state.moods || []).forEach(function (m) {
       if (m.id === id) { m.on = m.on === false ? true : false; m.ts = Date.now(); }
@@ -540,6 +732,12 @@
   }
 
   function leaveHousehold() {
+    if (notify.enabled) {
+      notify.enabled = false;
+      saveNotify();
+      var b = bridge();
+      if (b) { try { b.setNotifications(false, "", "", "", "{}"); } catch (e) {} }
+    }
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(STATE_KEY);
     state = null;
@@ -559,7 +757,9 @@
     if (session.sync === "offline") { cls += " offline"; txt = "Offline – viser sidst gemte"; }
     else if (session.sync === "err") { cls += " err"; txt = "Kunne ikke synke"; }
     else if (session.sync === "syncing") { txt = "Synkroniserer…"; }
-    return '<div class="' + cls + '"><span class="dot"></span>' + esc(txt) + "</div>";
+    if (pendingRender && !session.sheet) { cls += " pending"; txt = "Nye opdateringer – tryk"; }
+    return '<button type="button" class="' + cls + '" data-act="sync-now" aria-label="Opdater nu"><span class="dot"></span>' +
+      esc(txt) + ' <span class="re">⟳</span></button>';
   }
   function topBar(showBack) {
     var left = showBack
@@ -608,12 +808,15 @@
   function moodGrid() {
     var enabled = B.enabledMoods(state);
     var entry = B.dayEntry(me(), session.day) || {};
-    var show = enabled.slice(0, 11);
+    var show = enabled.slice(0, 10);
+    var sel = entry.mood && enabled.filter(function (m) { return m.id === entry.mood; })[0];
+    if (sel && show.indexOf(sel) < 0) show[show.length - 1] = sel;
     var html = '<div class="mood-grid">';
     show.forEach(function (m) {
-      html += '<button class="mood-cell' + (entry.mood === m.id ? " on" : "") + '" data-act="mood" data-id="' + m.id + '">' +
-        '<span class="emo">' + m.emoji + '</span><span class="lab">' + esc(m.label) + "</span></button>";
+      html += '<button class="mood-cell' + (entry.mood === m.id ? " on" : "") + '" data-act="mood" data-id="' + esc(m.id) + '">' +
+        '<span class="emo">' + esc(m.emoji) + '</span><span class="lab">' + esc(m.label) + "</span></button>";
     });
+    html += '<button class="mood-cell add" data-act="mood-new" data-select="1"><span class="emo">＋</span><span class="lab">Nyt humør</span></button>';
     html += '<button class="mood-cell more" data-act="mood-more">Mere</button></div>';
     return html;
   }
@@ -674,12 +877,12 @@
     (state.members || []).forEach(function (mem) {
       var mine = mem.id === session.me;
       var entry = B.dayEntry(mem, session.day) || {};
-      var mood = entry.mood ? B.findMood(state, entry.mood) : null;
+      var mood = entry.mood ? B.moodDisplay(state, entry.mood) : null;
       html += '<div class="member-block"><div class="member-head">' +
         '<div class="avatar" style="background:' + esc(mem.color) + '">' + (mem.emoji || "🙂") + "</div>" +
         "<div><div class=\"who\">" + esc(mem.name) +
         (mine ? '<span class="you-badge">dig</span>' : "") + "</div>" +
-        '<div class="meta">' + (mood ? mood.emoji + " " + esc(mood.label) : "Ikke logget endnu") + "</div></div></div>";
+        '<div class="meta">' + (mood ? esc(mood.emoji) + " " + esc(mood.label) : "Ikke logget endnu") + "</div></div></div>";
       html += chipsMoment(mem, mine);
       html += energySlider(mem, mine);
       html += "</div>";
@@ -740,14 +943,14 @@
     html += '<div class="card"><h2>' + formatDate(session.day) + "</h2>";
     (state.members || []).forEach(function (m) {
       var e = B.dayEntry(m, session.day) || {};
-      var mood = e.mood ? B.findMood(state, e.mood) : null;
+      var mood = e.mood ? B.moodDisplay(state, e.mood) : null;
       var en = e.energy ? B.ENERGY.filter(function (x) { return x.id === e.energy; })[0] : null;
       var mom = e.moment ? B.MOMENTS.filter(function (x) { return x.id === e.moment; })[0] : null;
       html += '<div class="member-block"><div class="member-head">' +
         '<div class="avatar" style="background:' + esc(m.color) + '">' + (m.emoji || "🙂") + "</div>" +
         "<div><div class=\"who\">" + esc(m.name) + "</div>" +
         '<div class="meta">' +
-        (mood ? mood.emoji + " " + esc(mood.label) : "Ingen humør") +
+        (mood ? esc(mood.emoji) + " " + esc(mood.label) : "Ingen humør") +
         (en ? " · " + en.label + " energi" : "") +
         (mom ? " · " + mom.label : "") +
         "</div></div></div>";
@@ -841,6 +1044,26 @@
     return html;
   }
 
+  function notifyCard() {
+    var has = !!bridge();
+    var on = has && notify.enabled;
+    var html = '<div class="card notify-card"><h2>Notifikationer</h2>' +
+      '<div class="mood-edit"><span class="emo">🔔</span><div class="name">Få besked, når dine roomies opdaterer noget</div>' +
+      '<button class="toggle' + (on ? " on" : "") + '" data-act="notify-toggle" aria-label="Notifikationer til eller fra"><i></i></button></div>';
+    if (!has) {
+      html += '<p class="hint">Notifikationer virker kun i Android-appen (version 1.4 eller nyere). Installer den nyeste APK for at slå dem til.</p>';
+    } else if (on) {
+      NOTIFY_OPTS.forEach(function (o) {
+        html += '<div class="mood-edit sub"><span class="emo">' + o.emoji + '</span><div class="name">' + esc(o.label) + "</div>" +
+          '<button class="toggle' + (notify.opts[o.id] ? " on" : "") + '" data-act="notify-opt" data-id="' + o.id + '" aria-label="' + esc(o.label) + '"><i></i></button></div>';
+      });
+      html += '<p class="hint">Telefonen tjekker ca. hvert 15. minut, så der kan gå lidt tid. Du får kun besked om ændringer fra de andre – ikke dine egne.</p>';
+    } else {
+      html += '<p class="hint">Slået fra. Du kan selv vælge, hvad du vil have besked om.</p>';
+    }
+    return html + "</div>";
+  }
+
   function renderIndstillinger() {
     var html = topBar(true) +
       '<div class="card"><h2>Indstillinger</h2>' +
@@ -867,14 +1090,18 @@
     });
     html += "</div>";
 
+    html += notifyCard();
+
     html += '<div class="card"><h2>Humør – tryk for at omdøbe</h2>' +
-      '<p class="hint">Slå humør til eller fra, og giv dem dine egne navne.</p>';
-    (state.moods || []).forEach(function (m) {
+      '<p class="hint">Slå humør til eller fra, giv dem dine egne navne – eller lav helt nye.</p>' +
+      '<button class="btn ghost wide" data-act="mood-new" style="margin-bottom:8px">＋ Nyt humør</button>';
+    B.visibleMoods(state).forEach(function (m) {
       html += '<div class="mood-edit">' +
-        '<span class="emo">' + m.emoji + "</span>" +
-        '<button class="name" data-act="rename-mood-ask" data-id="' + m.id + '">' + esc(m.label) + "</button>" +
-        '<button class="pen" data-act="rename-mood-ask" data-id="' + m.id + '" aria-label="Omdøb">✏️</button>' +
-        '<button class="toggle' + (m.on === false ? "" : " on") + '" data-act="toggle-mood" data-id="' + m.id +
+        '<span class="emo">' + esc(m.emoji) + "</span>" +
+        '<button class="name" data-act="rename-mood-ask" data-id="' + esc(m.id) + '">' + esc(m.label) +
+        (m.custom ? ' <span class="you-badge">eget</span>' : "") + "</button>" +
+        '<button class="pen" data-act="rename-mood-ask" data-id="' + esc(m.id) + '" aria-label="Rediger">✏️</button>' +
+        '<button class="toggle' + (m.on === false ? "" : " on") + '" data-act="toggle-mood" data-id="' + esc(m.id) +
         '" aria-label="Slå til eller fra"><i></i></button></div>';
     });
     html += "</div>";
@@ -943,10 +1170,11 @@
         '<button class="list-row" data-act="go" data-page="forslag"><span class="ico">💡</span><div>Forslag til appen</div><span class="go">›</span></button>';
     } else if (sh.name === "mood-more") {
       var entry = B.dayEntry(me(), session.day) || {};
-      inner = "<h2>Alle humør</h2><div class=\"mood-grid\">";
+      inner = "<h2>Alle humør</h2><div class=\"mood-grid\">" +
+        '<button class="mood-cell add" data-act="mood-new" data-select="1"><span class="emo">＋</span><span class="lab">Nyt humør</span></button>';
       B.enabledMoods(state).forEach(function (m) {
-        inner += '<button class="mood-cell' + (entry.mood === m.id ? " on" : "") + '" data-act="mood" data-id="' + m.id + '">' +
-          '<span class="emo">' + m.emoji + '</span><span class="lab">' + esc(m.label) + "</span></button>";
+        inner += '<button class="mood-cell' + (entry.mood === m.id ? " on" : "") + '" data-act="mood" data-id="' + esc(m.id) + '">' +
+          '<span class="emo">' + esc(m.emoji) + '</span><span class="lab">' + esc(m.label) + "</span></button>";
       });
       inner += "</div>";
     } else if (sh.name === "edit-act") {
@@ -972,10 +1200,28 @@
           (d.hidden ? "Vis i forslag igen" : "Skjul i dagens forslag") + "</button>") +
         '<button class="btn wide" data-act="save-act">' + (d.isNew ? "Tilføj" : "Gem") + "</button>";
     } else if (sh.name === "rename-mood") {
-      var mood = B.findMood(state, sh.data.id);
-      inner = "<h2>Omdøb humør</h2>" +
-        '<input class="field" data-act="rename-mood-val" value="' + esc((sh.data.label != null ? sh.data.label : (mood && mood.label)) || "") + '">' +
-        '<button class="btn wide" data-act="rename-mood-save">Gem</button>';
+      var md = sh.data || {};
+      var mood = md.id ? B.findMood(state, md.id) : null;
+      var curEmoji = md.emoji != null ? md.emoji : (mood && mood.emoji) || "";
+      inner = "<h2>" + (md.isNew ? "Nyt humør" : "Rediger humør") + "</h2>" +
+        (md.isNew ? '<p class="hint">Alle i husstanden kan se og vælge det.</p>' : "") +
+        '<label class="hint">Navn</label>' +
+        '<input class="field" data-act="rename-mood-val" maxlength="24" placeholder="Fx. Pizzaglad" value="' +
+        esc((md.label != null ? md.label : (mood && mood.label)) || "") + '">' +
+        '<label class="hint">Emoji – skriv en hvilken som helst, eller vælg</label>' +
+        '<div class="emoji-input-row"><span class="emoji-preview">' + esc(B.cleanEmoji(curEmoji)) + "</span>" +
+        '<input class="field emoji-field" data-act="mood-emoji-val" maxlength="16" placeholder="🙂" value="' + esc(curEmoji) + '"></div>' +
+        '<div class="emoji-grid">';
+      B.MOOD_EMOJIS.forEach(function (em) {
+        inner += '<button type="button" class="' + (curEmoji === em ? "on" : "") + '" data-act="mood-pick-emoji" data-emoji="' + em + '">' + em + "</button>";
+      });
+      inner += "</div>" +
+        '<button class="btn wide" data-act="rename-mood-save">' + (md.isNew ? "Tilføj" : "Gem") + "</button>" +
+        (md.custom && !md.isNew ? '<button class="btn ghost wide" data-act="mood-del-ask" data-id="' + esc(md.id) + '" style="margin-top:8px">Slet humør</button>' : "");
+    } else if (sh.name === "mood-del") {
+      inner = "<h2>Slet humøret?</h2><p>Det forsvinder fra listen hos alle i husstanden. Dage, hvor det er brugt, viser det stadig.</p>" +
+        '<div class="confirm-row"><button class="btn ghost" data-act="sheet-close">Annuller</button>' +
+        '<button class="btn" data-act="mood-del" data-id="' + esc(sh.data.id) + '">Slet</button></div>';
     } else if (sh.name === "idea-del") {
       inner = "<h2>Slet forslaget?</h2><p>Det forsvinder for alle i husstanden.</p>" +
         '<div class="confirm-row"><button class="btn ghost" data-act="sheet-close">Annuller</button>' +
@@ -1001,6 +1247,7 @@
     var root = document.getElementById("app");
     if (!root) return;
     var snap = captureFocus();
+    pendingRender = false;
     if (!session.code || !state) {
       root.innerHTML = '<div class="screen" id="screen">' + renderSetup() + "</div>" + renderToast();
       bindFields(root);
@@ -1013,8 +1260,16 @@
     else if (session.page === "forslag") body = renderForslag();
     else if (session.page === "indstillinger") body = renderIndstillinger();
     else body = renderHome();
-    var tabs = (session.page === "forslag" || session.page === "indstillinger") ? tabBar() : tabBar();
+    var tabs = tabBar();
+    var oldSheet = root.querySelector(".sheet");
+    var sheetKey = session.sheet ? session.sheet.name + "|" + (session.sheet.data && session.sheet.data.id || "") : "";
+    var sheetTop = oldSheet && root.__sheetKey === sheetKey ? oldSheet.scrollTop : 0;
+    var winY = window.scrollY || 0;
     root.innerHTML = '<div class="screen" id="screen">' + body + "</div>" + tabs + renderSheet() + renderToast();
+    root.__sheetKey = sheetKey;
+    var newSheet = root.querySelector(".sheet");
+    if (newSheet && sheetTop) newSheet.scrollTop = sheetTop;
+    if (winY && Math.abs((window.scrollY || 0) - winY) > 1) window.scrollTo(0, winY);
     bindFields(root);
     restoreFocus(root, snap);
   }
@@ -1049,6 +1304,14 @@
     root.querySelectorAll("[data-act=rename-mood-val]").forEach(function (el) {
       el.addEventListener("input", function () { if (session.sheet) session.sheet.data.label = el.value; });
     });
+    root.querySelectorAll("[data-act=mood-emoji-val]").forEach(function (el) {
+      el.addEventListener("input", function () {
+        if (!session.sheet) return;
+        session.sheet.data.emoji = el.value;
+        var pv = root.querySelector(".emoji-preview");
+        if (pv) pv.textContent = B.cleanEmoji(el.value);
+      });
+    });
   }
 
   /* bind uses addEventListener on root every render – that would stack if we don't replace innerHTML (we do, so listeners are gone). Good. */
@@ -1060,6 +1323,12 @@
     var id = t.getAttribute("data-id");
     var page = t.getAttribute("data-page");
 
+    if (act === "sync-now") {
+      session.sync = "syncing";
+      patchChrome();
+      pull({ force: true }).then(function () { if (pendingRender && !session.sheet && !isEditing()) render(); });
+      return;
+    }
     if (act === "go") { go(page); return; }
     if (act === "back") { go("home"); return; }
     if (act === "sheet-bg" && ev.target.classList.contains("sheet-bg")) { closeSheet(); return; }
@@ -1105,13 +1374,18 @@
       } else toast(code);
       return;
     }
-    if (act === "set-me") { session.me = id; saveLocal(); render(); return; }
-    if (act === "rename-mood-ask") { openSheet("rename-mood", { id: id }); return; }
-    if (act === "rename-mood-save") {
-      renameMood(session.sheet.data.id, session.sheet.data.label);
-      closeSheet();
+    if (act === "set-me") { session.me = id; saveLocal(); syncNotifyConfig(); render(); return; }
+    if (act === "rename-mood-ask") { openMoodEditor(id); return; }
+    if (act === "rename-mood-save") { saveMoodFromSheet(); return; }
+    if (act === "mood-new") { openMoodEditor(null, { select: t.getAttribute("data-select") === "1" }); return; }
+    if (act === "mood-pick-emoji") {
+      if (session.sheet && session.sheet.data) { session.sheet.data.emoji = t.getAttribute("data-emoji"); render(); }
       return;
     }
+    if (act === "mood-del-ask") { openSheet("mood-del", { id: id }); return; }
+    if (act === "mood-del") { deleteMood(id); return; }
+    if (act === "notify-toggle") { toggleNotify(); return; }
+    if (act === "notify-opt") { toggleNotifyOpt(id); return; }
     if (act === "toggle-mood") { toggleMood(id); return; }
     if (act === "leave") { openSheet("leave"); return; }
     if (act === "leave-yes") { closeSheet(); leaveHousehold(); return; }
@@ -1193,10 +1467,31 @@
     back: handleBack,
     getState: function () { return state; },
     getSession: function () { return session; },
-    isEditing: isEditing,
+    isEditing: blocksReload,
+    isBusy: isBusy,
+    hasPending: function () { return pendingRender; },
     pullNow: function () { return pull(); },
-    flushDrafts: flushAllDrafts
+    refresh: function () { return pull({ force: true }); },
+    pollMs: POLL_MS,
+    flushDrafts: flushAllDrafts,
+    onNotifyPermission: onNotifyPermission,
+    getNotify: function () { return notify; }
   };
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { flushAllDrafts(); sendSnapshot(true); return; }
+    if (session.storageUrl && Date.now() - lastPullAt > 5000) pull();
+  });
+  window.addEventListener("online", function () { if (session.storageUrl) pull(); });
+  ["pointerdown", "touchstart", "mousedown"].forEach(function (t) {
+    document.addEventListener(t, function () { pointerDown = true; markInteract(); }, { capture: true, passive: true });
+  });
+  ["pointerup", "pointercancel", "touchend", "touchcancel", "mouseup"].forEach(function (t) {
+    document.addEventListener(t, function () { pointerDown = false; markInteract(); }, { capture: true, passive: true });
+  });
+  document.addEventListener("scroll", markInteract, { capture: true, passive: true });
+  document.addEventListener("keydown", markInteract, { capture: true, passive: true });
+  setInterval(flushPendingRender, 1000);
 
   function boot() {
     var root = document.getElementById("app");
@@ -1212,6 +1507,7 @@
         render();
         pull();
         startPoll();
+        if (notify.enabled) syncNotifyConfig();
       });
       render();
       startPoll();
